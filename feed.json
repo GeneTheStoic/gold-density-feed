@@ -19,6 +19,6 @@
   "bench_kurtosis": 3.0974,
   "density_area": 1.0,
   "contracts_used": 79,
-  "updated_utc": "2026-08-25T03:28:29Z",
+  "updated_utc": "2026-08-25T04:20:22Z",
   "source": "option chain, risk-neutral density by Breeden-Litzenberger"
 }
