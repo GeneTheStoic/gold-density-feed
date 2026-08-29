@@ -107,6 +107,10 @@ RV_WINDOW = 30
 # stronger freshness test than a trade print
 MAX_QUOTE_AGE_DAYS = 7
 
+# the spot comes from a different request than the chain, so it can be stale while
+# the options are current. Beyond this much implied carry it is stale, not financed
+CARRY_MAX = 25.0
+
 # the sensitivity study: every combination is recovered and the spread is published.
 # FIT_WIDTH is included because a fit weighted hard toward the money can flatten the
 # wings, which is exactly the region the recovery exists to measure
@@ -230,7 +234,7 @@ def strike_map(frame):
     return out
 
 
-def forward_from_parity(chain, spot, t_years, rate, debug=False):
+def forward_from_parity(chain, t_years, rate, debug=False):
     """
     Read the forward out of the market instead of assuming a carry.
 
@@ -238,12 +242,18 @@ def forward_from_parity(chain, spot, t_years, rate, debug=False):
     quoted on both sides gives an estimate of F. The median over the strikes nearest
     the money is taken, which is robust to one bad quote.
 
+    Nothing in here uses a spot quote. The strike nearest the money is the one where
+    the call and the put are closest in price, which is a property of the chain
+    itself. A spot that arrives late or stale therefore cannot move the forward, nor
+    move which strikes are treated as being at the money, which is the mistake this
+    replaced: the spot comes from a different request than the options do.
+
     This matters because GLD is not a non-dividend-paying asset in the pricing sense.
     It carries an expense ratio and its own financing economics, so F = S * exp(rT)
     would be wrong and would bias every volatility solved against it.
     """
     cmap, pmap = strike_map(chain.calls), strike_map(chain.puts)
-    common = sorted(set(cmap) & set(pmap), key=lambda k: abs(k - spot))
+    common = sorted(set(cmap) & set(pmap), key=lambda k: abs(cmap[k] - pmap[k]))
     if len(common) < 3:
         raise ChainUnusable("fewer than three strikes quoted on both sides")
 
@@ -257,10 +267,6 @@ def forward_from_parity(chain, spot, t_years, rate, debug=False):
     if debug:
         print("  forward %.4f from put-call parity over %d strikes, spread %.4f%%"
               % (fwd, len(estimates), 100.0 * spread))
-        print("  net carry %.4f%% a year against spot %.2f, so against a %.1f%% discount"
-              " rate the holding cost is about %.2f%%"
-              % (100.0 * math.log(fwd / spot) / t_years, spot, 100.0 * rate,
-                 100.0 * rate - 100.0 * math.log(fwd / spot) / t_years))
     return fwd, spread
 
 
@@ -654,14 +660,59 @@ def filter_sensitivity(chain, fwd, t_years, rate, degree, tail, debug=False):
     return out
 
 
+def spot_price(ticker, closes):
+    """
+    Take the freshest spot the provider will give, and say which one it was.
+
+    The daily history can lag the option chain by days, and a spot that lags produces
+    a carry that is arithmetic rather than finance. The intraday quote is asked for
+    first because it belongs to roughly the same moment as the chain. The last
+    completed daily bar is the fallback. Which one was used travels with the feed,
+    because a reader checking the carry is entitled to know.
+    """
+    def probe(source, key):
+        """Read one field however this version of the library exposes it."""
+        try:
+            return finite(source[key])
+        except Exception:                  # not a mapping, or the lookup itself failed
+            pass
+        try:
+            return finite(getattr(source, key))
+        except Exception:                  # not an attribute, or the endpoint is down
+            return 0.0
+
+    try:
+        fast = ticker.fast_info
+    except Exception:                      # the quote endpoint is optional, not fatal
+        fast = None
+    if fast is not None:
+        for key in ("last_price", "lastPrice", "regular_market_price"):
+            value = probe(fast, key)
+            if value > 0.0:
+                return value, "intraday quote"
+
+    if not closes.empty:
+        value = finite(closes.iloc[-1])
+        if value > 0.0:
+            return value, "last daily close"
+    return float("nan"), "unavailable"
+
+
 def build_feed(debug=False):
     """Pull the chain, recover the density, run every check, assemble the feed."""
     tk = yf.Ticker(TICKER)
     history = tk.history(period="6mo", interval="1d")
     if history.empty:
         raise RuntimeError("no price history returned for %s" % TICKER)
-    spot = float(history["Close"].iloc[-1])
-    rv = realized_volatility(history["Close"])
+    # the provider returns a row for the current day even when the session has not
+    # opened, and that row's close is NaN. Taking the last row blindly puts NaN into
+    # the spot, and from there into the carry and every probability measured against
+    # it, so the last row with an actual close is the one taken
+    closes = history["Close"].dropna()
+    if closes.empty:
+        raise RuntimeError("no usable close price returned for %s" % TICKER)
+    spot, spot_from = spot_price(tk, closes)
+    rv = realized_volatility(closes)
 
     chosen = pick_expiry(tk)
     if chosen is None:
@@ -669,10 +720,31 @@ def build_feed(debug=False):
     expiry, days = chosen
     t_years = days / 365.0
     if debug:
-        print("  spot %.2f, expiry %s (%d days)" % (spot, expiry, days))
+        print("  spot %.2f from the %s, expiry %s (%d days)"
+              % (spot, spot_from, expiry, days))
 
     chain = tk.option_chain(expiry)
-    fwd, fwd_spread = forward_from_parity(chain, spot, t_years, RISK_FREE, debug)
+    fwd, fwd_spread = forward_from_parity(chain, t_years, RISK_FREE, debug)
+
+    # the spot arrives from a different request than the chain does, so it can be
+    # stale while the options are current. Nothing in the recovery uses it: it is
+    # only here to report the carry and the probability measured against it. When it
+    # implies a carry no financing cost could produce, the spot is the thing that is
+    # wrong, so it is dropped rather than published as a number that looks real
+    carry = (100.0 * math.log(fwd / spot) / t_years
+             if math.isfinite(spot) and spot > 0.0 else float("nan"))
+    if not math.isfinite(carry) or abs(carry) > CARRY_MAX:
+        if debug:
+            print("  spot %.2f from the %s against the forward %.4f implies a carry of"
+                  " %+.1f%% a year, which is not a financing cost. That quote is stale,"
+                  " so the spot, the carry and the probability above it are published"
+                  " as null and the density is unaffected."
+                  % (spot, spot_from, fwd, carry))
+        spot, carry, spot_from = float("nan"), float("nan"), "rejected as stale"
+    elif debug:
+        print("  net carry %+.4f%% a year against spot %.2f, so against a %.1f%%"
+              " discount rate the holding cost is about %.2f%%"
+              % (carry, spot, 100.0 * RISK_FREE, 100.0 * RISK_FREE - carry))
     gap_max, gap_med = parity_iv_gap(chain, fwd, t_years, RISK_FREE)
     if debug and math.isfinite(gap_max):
         print("  put-call implied volatility gap near the money: median %.4f, worst %.4f"
@@ -689,7 +761,8 @@ def build_feed(debug=False):
     mean, sd, skew, kurt = moments(strikes, dens)
     atm_vol = smooth_vol(fit, fwd, fwd, t_years, chosen_tail)
     bench_skew, bench_kurt = lognormal_shape(atm_vol, t_years)
-    prob_above = float(1.0 - np.interp(spot, strikes, cdf))
+    prob_above = (float(1.0 - np.interp(spot, strikes, cdf))
+                  if math.isfinite(spot) else float("nan"))
     sens = sensitivity(chain, fwd, t_years, RISK_FREE, debug)
     filt = filter_sensitivity(chain, fwd, t_years, RISK_FREE, fit["degree"],
                               chosen_tail, debug)
@@ -708,13 +781,14 @@ def build_feed(debug=False):
         print("  kurtosis %.4f against a lognormal %.4f" % (kurt, bench_kurt))
         print("  90 percent band %.2f to %.2f" % (levels[0.05], levels[0.95]))
 
-    return {
+    feed = {
         "symbol": TICKER,
         "underlying_note": "GLD ETF, not spot gold and not broker XAUUSD",
-        "spot": round(spot, 2),
+        "spot": round(spot, 2) if math.isfinite(spot) else float("nan"),
+        "spot_source": spot_from,
         "forward": round(fwd, 4),
         "forward_source": "put-call parity",
-        "net_carry_pct": round(100.0 * math.log(fwd / spot) / t_years, 4),
+        "net_carry_pct": round(carry, 4) if math.isfinite(carry) else float("nan"),
         "expiry": expiry,
         "days_to_expiry": days,
         "atm_iv": round(atm_vol, 6),
@@ -764,6 +838,13 @@ def build_feed(debug=False):
         "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": "GLD option chain, risk-neutral density by Breeden-Litzenberger",
     }
+    # NaN and Infinity are not JSON. Python will write them anyway, and a strict
+    # parser downstream then rejects the whole file, so any field that failed to
+    # compute is published as null instead of as a token no standard reader accepts.
+    # math.isfinite is the test, not the finite helper above, because that helper
+    # maps a bad value to zero and zero is a legitimate reading for half these fields
+    return {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+            for k, v in feed.items()}
 
 
 def _inv_erf(y):
@@ -884,12 +965,19 @@ def main():
     print("\nGLD, expiry %s in %d days, %d contracts used, fit degree %d"
           % (feed["expiry"], feed["days_to_expiry"], feed["contracts_used"],
              feed["fit_degree"]))
-    print("forward %.4f from put-call parity, net carry %+.2f%% a year"
-          % (feed["forward"], feed["net_carry_pct"]))
+    # a field that could not be computed is published as null, so the summary has to
+    # say so rather than trying to format it
+    def show(key, spec="%.4f"):
+        value = feed.get(key)
+        return "not available" if value is None else spec % value
+
+    print("forward %.4f from put-call parity, net carry %s a year"
+          % (feed["forward"], show("net_carry_pct", "%+.2f%%")))
     print("90 percent band: %.1f%% to %.1f%% of the forward"
           % (feed["r05"] * 100, feed["r95"] * 100))
-    print("negative mass %.4f%%, monotonicity %d, convexity %d"
-          % (feed["neg_mass_pct"], feed["mono_violations"], feed["convex_violations"]))
+    print("negative mass %s, monotonicity %d, convexity %d"
+          % (show("neg_mass_pct", "%.4f%%"), feed["mono_violations"],
+             feed["convex_violations"]))
     print("median is stable across %d specifications: %.4f to %.4f"
           % (feed["sens_runs"], feed["sens_p50_min"], feed["sens_p50_max"]))
     print("kurtosis is not: %.2f to %.2f across the same specifications"
