@@ -9,7 +9,7 @@
   "expiry": "2026-09-30",
   "days_to_expiry": 32,
   "atm_iv": 0.230404,
-  "rv_30d_gld": 0.233102,
+  "rv_30d_gld": 0.257098,
   "r05": 0.894438,
   "r25": 0.955318,
   "r50": 0.995745,
@@ -52,6 +52,6 @@
   "filter_p05_max": 0.894438,
   "reliable": "median and the 25 to 75 band",
   "less_reliable": "skewness, kurtosis and the 5 and 95 tails",
-  "updated_utc": "2026-08-29T18:49:05Z",
+  "updated_utc": "2026-08-29T21:55:54Z",
   "source": "GLD option chain, risk-neutral density by Breeden-Litzenberger"
 }
