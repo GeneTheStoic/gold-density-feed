@@ -51,6 +51,6 @@
   "filter_p05_max": 0.89425,
   "reliable": "median and the 25 to 75 band",
   "less_reliable": "skewness, kurtosis and the 5 and 95 tails",
-  "updated_utc": "2026-08-29T00:45:35Z",
+  "updated_utc": "2026-08-29T02:25:42Z",
   "source": "GLD option chain, risk-neutral density by Breeden-Litzenberger"
 }
