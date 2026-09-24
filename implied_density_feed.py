@@ -107,14 +107,15 @@ FIT_WIDTH = 0.35
 MIN_POINTS = 8
 MIN_SPAN = 0.04
 
-# outside the quoted strikes the fit must not be extrapolated. Flat is the conservative
-# default; choose_fit also tests linear total variance and publishes the selected rule
-TAIL_RULE = "flat"
+# outside the quoted strikes the fit must not be extrapolated. The live feed does not
+# read this default: choose_fit tries linear total variance first, falls back to flat,
+# and publishes the rule it used. The default only applies when a caller names no rule
+TAIL_RULE = "linvar"
 
 # a recovered call curve that is not convex is not arbitrage-consistent, and the
-# density it produces contains negative probability. Rather than fixing a degree and
-# repairing whatever comes out, the degree is chosen so the curve is convex and almost
-# nothing needs repairing. This is the cheap form of a shape constraint
+# density it produces contains negative probability. The specification is chosen to
+# leave the least negative mass, and the first one under this gate is taken. The gate
+# does not guarantee convexity: remaining violations are counted and published
 NEG_MASS_MAX = 1.0
 
 # 30 completed sessions roughly matches the target option horizon; realized
@@ -274,7 +275,7 @@ def forward_from_parity(chain, t_years, rate, debug=False):
     """
     Read the forward out of the market instead of assuming a carry.
 
-    Put-call parity says C - P = exp(-rT) * (F - K) at every strike, so each strike
+    European put-call parity says C - P = exp(-rT) * (F - K) at every strike, so each strike
     quoted on both sides gives an estimate of F. The median over the strikes nearest
     the money is taken, which is robust to one bad quote.
 
@@ -288,7 +289,7 @@ def forward_from_parity(chain, t_years, rate, debug=False):
     sense. Dividends, fees, storage, or futures-roll economics can make F = S * exp(rT)
     wrong and bias every volatility solved against it.
 
-    Assumes European put-call parity is an adequate approximation for the matched quotes.
+    Assumes that European put-call parity is an adequate approximation for these quotes.
     """
     cmap, pmap = strike_map(chain.calls), strike_map(chain.puts)
     common = sorted(set(cmap) & set(pmap), key=lambda k: abs(cmap[k] - pmap[k]))
@@ -473,8 +474,9 @@ def density_from_smile(fit, fwd, t_years, rate, tail=TAIL_RULE):
     not guarantee one, so three things are measured rather than assumed: whether the
     call curve falls monotonically with strike, whether it is convex, and how much
     negative probability mass the second difference produced. Negative mass is clipped
-    because a density cannot be negative, but the amount is published, because a large
-    figure means the fit was not arbitrage-consistent.
+    and the density renormalized, so every percentile describes the repaired density.
+    The amount repaired is published, because a large figure means the fit was not
+    arbitrage-consistent. Where on the grid the repair happened is not reported.
 
     Assumes a positive forward and time to expiry and an explicit supported tail rule.
     """
@@ -495,14 +497,21 @@ def density_from_smile(fit, fwd, t_years, rate, tail=TAIL_RULE):
     convex_bad = int(np.sum(second < -tol_second))
 
     #--- no-arbitrage bounds on the call itself: it can never be worth less than its
-    #--- discounted intrinsic value, nor more than the discounted forward
+    #--- discounted intrinsic value, nor more than the discounted forward. These are
+    #--- prices, so the tolerance is a price too, a tiny fraction of the forward
     disc = math.exp(-rate * t_years)
     lower = disc * np.maximum(fwd - grid, 0.0)
     upper = disc * fwd
-    bound_bad = int(np.sum(calls < lower - tol_second) + np.sum(calls > upper + tol_second))
+    tol_price = 1e-8 * fwd
+    bound_bad = int(np.sum(calls < lower - tol_price) + np.sum(calls > upper + tol_price))
 
     strikes = grid[1:-1]
     dens = math.exp(rate * t_years) * second
+    #--- the negative mass is reported as a share of the gross absolute mass, the
+    #--- positive and negative parts added together. That share stays between 0 and
+    #--- 100 even for a badly broken fit. For small values it is within a factor of
+    #--- (1 + 2x) of the share of net probability, so 0.004 percent reads the same
+    #--- either way and 4.74 percent of gross is about 5.2 percent of net
     gross = float(np.sum(np.abs(dens)) * step)
     neg_mass = float(np.sum(np.abs(dens[dens < 0.0])) * step)
     neg_pct = (100.0 * neg_mass / gross) if gross > 0 else float("nan")
@@ -520,20 +529,22 @@ def density_from_smile(fit, fwd, t_years, rate, tail=TAIL_RULE):
 
 def choose_fit(points, fwd, t_years, rate, tail=None, debug=False):
     """
-    Pick the smile specification whose recovered call curve is arbitrage-consistent.
+    Pick the smile specification that leaves the least negative probability mass.
 
     Two decisions are searched together, because they interact. The polynomial degree
     sets how much curvature the smile may have. The tail rule sets what happens outside
     the quoted strikes. Holding volatility flat out there is the cruder of the two
     rules: where a sloped polynomial meets a flat extension there is a kink, a kink in
     the volatility curve becomes a non-convex spot in the call curve, and a non-convex
-    call curve produces negative probability. Extending total variance linearly at the
-    slope of the edge joins smoothly instead, so it is tried first.
+    call curve produces negative probability. Instead, extending total variance linearly
+    using the edge slope produces a smooth join, so that rule is tried first.
 
     Every combination is recovered in full and the first one that leaves less than
     NEG_MASS_MAX of negative probability mass is taken, richest degree first. Negative
-    mass is the gate because it measures the economic damage directly. If nothing
-    qualifies the least bad is used, and the figures are published either way.
+    mass is the gate because it measures the economic damage directly. It is not a
+    proof of arbitrage consistency: convexity violations can survive the gate, and
+    they are counted and published. If nothing qualifies the least bad is used, and
+    the figures are published either way.
 
     Assumes points have already passed the quote, liquidity and strike-window filters.
     """
@@ -560,7 +571,7 @@ def choose_fit(points, fwd, t_years, rate, tail=None, debug=False):
         raise ChainUnusable("no specification produced a usable density")
     best = min(attempts, key=lambda a: a[2]["neg_mass_pct"])
     if debug:
-        print("  nothing was fully arbitrage-consistent, using degree %d with the %s "
+        print("  nothing passed the negative-mass gate, using degree %d with the %s "
               "tail, the least bad" % (best[0]["degree"], best[0]["tail"]))
     return best[0], best[1]
 
